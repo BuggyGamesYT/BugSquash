@@ -18,6 +18,8 @@ import android.os.Looper;
 import android.text.InputFilter;
 import android.text.InputType;
 import android.view.Gravity;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebView;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -27,6 +29,9 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.Iterator;
 import java.util.Random;
 
@@ -63,6 +68,11 @@ public class GameView extends View {
     private volatile ArrayList<String[]> board = new ArrayList<>();
     private String myName, lastMine;
     private boolean dialogOpen;
+    private volatile String lastErr = "";
+    private WebView web; // fallback network path (Chrome's stack), same as the web version
+    private final ConcurrentHashMap<Integer, String[]> webRes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, CountDownLatch> webWait = new ConcurrentHashMap<>();
+    private int webSeq = 0;
 
     public GameView(Context c) {
         super(c);
@@ -70,6 +80,18 @@ public class GameView extends View {
         prefs = c.getSharedPreferences("bugsquash", Context.MODE_PRIVATE);
         best = prefs.getInt("best", 0);
         myName = prefs.getString("name", "");
+        board = parse(prefs.getString("board", ""));
+        try {
+            web = new WebView(c);
+            web.getSettings().setJavaScriptEnabled(true);
+            web.addJavascriptInterface(new Object() {
+                @JavascriptInterface public void done(int id, boolean ok, String t) {
+                    webRes.put(id, new String[]{ok ? "1" : "0", t});
+                    CountDownLatch l = webWait.get(id); if (l != null) l.countDown();
+                }
+            }, "BS");
+            web.loadDataWithBaseURL("https://buggygamesyt.github.io/bugsquash/", "<html></html>", "text/html", "utf-8", null);
+        } catch (Throwable t) { web = null; }
         new Thread(this::lbGet).start();
         tp.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
         tp.setTextAlign(Paint.Align.CENTER);
@@ -217,7 +239,36 @@ public class GameView extends View {
     }
 
     // ---------------- leaderboard ----------------
-    private static String http(String url, boolean post) throws Exception {
+    private String http(String url, boolean post) throws Exception {
+        try { return httpDirect(url, post); }
+        catch (Exception e) {
+            String err1 = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
+            if (web == null) { lastErr = err1; throw e; }
+            try { return httpWeb(url, post); }
+            catch (Exception e2) { lastErr = err1 + " / web: " + e2.getMessage(); throw e2; }
+        }
+    }
+
+    private String httpWeb(final String url, final boolean post) throws Exception {
+        final int id;
+        synchronized (this) { id = ++webSeq; }
+        CountDownLatch l = new CountDownLatch(1);
+        webWait.put(id, l);
+        final String js = "fetch(" + jsq(url) + ",{method:'" + (post ? "POST" : "GET") + "',cache:'no-store'})"
+            + ".then(r=>r.ok?r.text():Promise.reject('HTTP '+r.status))"
+            + ".then(t=>BS.done(" + id + ",true,t)).catch(e=>BS.done(" + id + ",false,String(e)))";
+        ui.post(() -> { try { web.evaluateJavascript(js, null); } catch (Throwable t) { webRes.put(id, new String[]{"0", String.valueOf(t)}); l.countDown(); } });
+        boolean got = l.await(10, TimeUnit.SECONDS);
+        webWait.remove(id);
+        String[] r = webRes.remove(id);
+        if (!got || r == null) throw new Exception("timeout");
+        if (!"1".equals(r[0])) throw new Exception(r[1]);
+        return r[1];
+    }
+
+    private static String jsq(String s) { return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"; }
+
+    private static String httpDirect(String url, boolean post) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(8000); c.setReadTimeout(8000);
         c.setUseCaches(false);
@@ -246,7 +297,12 @@ public class GameView extends View {
 
     private boolean lbGet() {
         for (int i = 0; i < 4; i++) {
-            try { board = parse(http(LB_URL + "GetValue/" + LB_APP + "/" + LB_KEY, false)); return true; }
+            try {
+                String raw = http(LB_URL + "GetValue/" + LB_APP + "/" + LB_KEY, false);
+                board = parse(raw); lastErr = "";
+                prefs.edit().putString("board", raw).apply();
+                return true;
+            }
             catch (Exception ignored) {}
             try { Thread.sleep(700 + i * 500); } catch (InterruptedException ignored) {}
         }
@@ -316,7 +372,7 @@ public class GameView extends View {
                 final boolean ok = lbSubmit(name, sc);
                 ui.post(() -> {
                     if (ok) { lastMine = name; dlg.dismiss(); showBoard(); }
-                    else { dlg.setMessage("Couldn't save. Check your connection and tap Submit again."); v.setEnabled(true); }
+                    else { dlg.setMessage("Couldn't save. Tap Submit to try again.\n(" + lastErr + ")"); v.setEnabled(true); }
                 });
             }).start();
         }));
@@ -331,8 +387,7 @@ public class GameView extends View {
         tv.setTextSize(18);
         int pad = (int) (24 * d);
         tv.setPadding(pad, pad / 2, pad, 0);
-        tv.setText(boardText() + (board.isEmpty() ? "" : ""));
-        if (board.isEmpty()) tv.setText("Loading…");
+        tv.setText(board.isEmpty() ? "Loading…" : boardText());
         final AlertDialog dlg = new AlertDialog.Builder(getContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("🏆 TOP 10")
             .setView(tv)
@@ -344,7 +399,7 @@ public class GameView extends View {
         new Thread(() -> {
             while (open[0]) {
                 final boolean ok = lbGet();
-                ui.post(() -> tv.setText(ok ? boardText() : (board.isEmpty() ? "Couldn't reach the leaderboard." : boardText())));
+                ui.post(() -> tv.setText(ok ? boardText() : boardText() + "\n\nCan't reach the leaderboard right now, retrying…\n(" + lastErr + ")"));
                 for (int i = 0; i < 150 && open[0]; i++) { try { Thread.sleep(100); } catch (InterruptedException ignored) {} }
             }
         }).start();

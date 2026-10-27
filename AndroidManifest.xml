@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.buggygames.bugsquash"
-    android:versionCode="2"
-    android:versionName="1.01">
+    android:versionCode="3"
+    android:versionName="1.02">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="37" />
     <application
         android:label="Bug Squash"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
         <activity android:name=".MainActivity" android:exported="true"

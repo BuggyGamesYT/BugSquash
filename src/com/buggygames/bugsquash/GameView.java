@@ -11,6 +11,21 @@ import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputFilter;
+import android.text.InputType;
+import android.view.Gravity;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.Random;
@@ -39,12 +54,23 @@ public class GameView extends View {
     private final Paint tp = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF rf = new RectF();
     private final RectF pauseBtn = new RectF();
+    private final RectF lbBtn = new RectF();
+
+    // ---- online leaderboard (shared with the web version) ----
+    private static final String LB_URL = "https://keyvalue.immanuel.co/api/KeyVal/";
+    private static final String LB_APP = "7qj6nvan", LB_KEY = "bugsquash";
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private volatile ArrayList<String[]> board = new ArrayList<>();
+    private String myName, lastMine;
+    private boolean dialogOpen;
 
     public GameView(Context c) {
         super(c);
         d = c.getResources().getDisplayMetrics().density;
         prefs = c.getSharedPreferences("bugsquash", Context.MODE_PRIVATE);
         best = prefs.getInt("best", 0);
+        myName = prefs.getString("name", "");
+        new Thread(this::lbGet).start();
         tp.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
         tp.setTextAlign(Paint.Align.CENTER);
         setHapticFeedbackEnabled(true);
@@ -183,6 +209,158 @@ public class GameView extends View {
             best = score; newBest = true;
             prefs.edit().putInt("best", best).apply();
         }
+        final int sc = score;
+        if (sc > 0) new Thread(() -> {
+            lbGet();
+            if (qualifies(sc)) ui.post(() -> { if (state == OVER) askName(sc); });
+        }).start();
+    }
+
+    // ---------------- leaderboard ----------------
+    private static String http(String url, boolean post) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(8000); c.setReadTimeout(8000);
+        c.setUseCaches(false);
+        if (post) { c.setRequestMethod("POST"); c.setDoOutput(true); c.setFixedLengthStreamingMode(0); c.getOutputStream().close(); }
+        int code = c.getResponseCode();
+        if (code != 200) { c.disconnect(); throw new Exception("HTTP " + code); }
+        InputStream in = c.getInputStream();
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        byte[] buf = new byte[1024]; int n;
+        while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+        in.close(); c.disconnect();
+        return bo.toString("UTF-8");
+    }
+
+    private static ArrayList<String[]> parse(String t) {
+        ArrayList<String[]> out = new ArrayList<>();
+        t = t.trim();
+        if (t.startsWith("\"")) t = t.substring(1);
+        if (t.endsWith("\"")) t = t.substring(0, t.length() - 1);
+        for (String e : t.split("_")) {
+            String[] kv = e.split("-");
+            if (kv.length == 2 && kv[0].matches("[A-Z0-9]{3}") && kv[1].matches("[0-9]{1,7}") && Integer.parseInt(kv[1]) > 0) out.add(kv);
+        }
+        return out;
+    }
+
+    private boolean lbGet() {
+        for (int i = 0; i < 4; i++) {
+            try { board = parse(http(LB_URL + "GetValue/" + LB_APP + "/" + LB_KEY, false)); return true; }
+            catch (Exception ignored) {}
+            try { Thread.sleep(700 + i * 500); } catch (InterruptedException ignored) {}
+        }
+        return false;
+    }
+
+    private boolean lbSubmit(String name, int sc) {
+        for (int i = 0; i < 5; i++) {
+            if (lbGet()) {
+                ArrayList<String[]> b = new ArrayList<>();
+                int old = 0;
+                for (String[] e : board) { if (e[0].equals(name)) old = Integer.parseInt(e[1]); else b.add(e); }
+                b.add(new String[]{name, String.valueOf(Math.max(sc, old))});
+                b.sort((x, y) -> Integer.parseInt(y[1]) - Integer.parseInt(x[1]));
+                while (b.size() > 10) b.remove(b.size() - 1);
+                StringBuilder sb = new StringBuilder();
+                for (String[] e : b) { if (sb.length() > 0) sb.append('_'); sb.append(e[0]).append('-').append(e[1]); }
+                try { http(LB_URL + "UpdateValue/" + LB_APP + "/" + LB_KEY + "/" + sb, true); board = b; return true; }
+                catch (Exception ignored) {}
+            }
+            try { Thread.sleep(800 + i * 600); } catch (InterruptedException ignored) {}
+        }
+        return false;
+    }
+
+    private boolean qualifies(int sc) {
+        ArrayList<String[]> b = board;
+        return sc > 0 && (b.size() < 10 || sc > Integer.parseInt(b.get(b.size() - 1)[1]));
+    }
+
+    private void askName(final int sc) {
+        if (dialogOpen || !(getContext() instanceof Activity) || ((Activity) getContext()).isFinishing()) return;
+        dialogOpen = true;
+        final EditText in = new EditText(getContext());
+        in.setText(myName);
+        in.setHint("AAA");
+        in.setGravity(Gravity.CENTER);
+        in.setTextSize(30);
+        in.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+        in.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        in.setFilters(new InputFilter[]{ new InputFilter.LengthFilter(3), new InputFilter.AllCaps(),
+            (src, st, en, dst, ds, de) -> {
+                StringBuilder sb = new StringBuilder();
+                for (int i = st; i < en; i++) { char ch = src.charAt(i); if (Character.isLetterOrDigit(ch) && ch < 128) sb.append(ch); }
+                return sb.length() == en - st ? null : sb.toString();
+            }});
+        LinearLayout box = new LinearLayout(getContext());
+        int pad = (int) (24 * d);
+        box.setPadding(pad, pad / 2, pad, 0);
+        box.addView(in, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        final AlertDialog dlg = new AlertDialog.Builder(getContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("NEW TOP SCORE!")
+            .setMessage("You scored " + sc + ". Put your name on the board (3 letters or numbers):")
+            .setView(box)
+            .setPositiveButton("Submit", null)
+            .setNegativeButton("Skip", null)
+            .create();
+        dlg.setOnDismissListener(x -> dialogOpen = false);
+        dlg.setOnShowListener(x -> dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            final String name = in.getText().toString().toUpperCase();
+            if (!name.matches("[A-Z0-9]{3}")) { in.setError("Use exactly 3 letters or numbers"); return; }
+            myName = name;
+            prefs.edit().putString("name", name).apply();
+            v.setEnabled(false);
+            dlg.setMessage("Saving…");
+            new Thread(() -> {
+                final boolean ok = lbSubmit(name, sc);
+                ui.post(() -> {
+                    if (ok) { lastMine = name; dlg.dismiss(); showBoard(); }
+                    else { dlg.setMessage("Couldn't save. Check your connection and tap Submit again."); v.setEnabled(true); }
+                });
+            }).start();
+        }));
+        dlg.show();
+    }
+
+    private void showBoard() {
+        if (dialogOpen || !(getContext() instanceof Activity) || ((Activity) getContext()).isFinishing()) return;
+        dialogOpen = true;
+        final TextView tv = new TextView(getContext());
+        tv.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+        tv.setTextSize(18);
+        int pad = (int) (24 * d);
+        tv.setPadding(pad, pad / 2, pad, 0);
+        tv.setText(boardText() + (board.isEmpty() ? "" : ""));
+        if (board.isEmpty()) tv.setText("Loading…");
+        final AlertDialog dlg = new AlertDialog.Builder(getContext(), android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("🏆 TOP 10")
+            .setView(tv)
+            .setPositiveButton("Close", null)
+            .create();
+        final boolean[] open = {true};
+        dlg.setOnDismissListener(x -> { dialogOpen = false; open[0] = false; });
+        dlg.show();
+        new Thread(() -> {
+            while (open[0]) {
+                final boolean ok = lbGet();
+                ui.post(() -> tv.setText(ok ? boardText() : (board.isEmpty() ? "Couldn't reach the leaderboard." : boardText())));
+                for (int i = 0; i < 150 && open[0]; i++) { try { Thread.sleep(100); } catch (InterruptedException ignored) {} }
+            }
+        }).start();
+    }
+
+    private String boardText() {
+        ArrayList<String[]> b = board;
+        if (b.isEmpty()) return "No scores yet. Be the first!";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < b.size(); i++) {
+            String[] e = b.get(i);
+            String rank = String.format("%2d", i + 1);
+            sb.append(rank).append("  ").append(e[0]).append(e[0].equals(lastMine) ? " ◀" : "  ")
+              .append(String.format("%9s", e[1])).append(i < b.size() - 1 ? "\n" : "");
+        }
+        return sb.toString();
     }
 
     // ---------------- input ----------------
@@ -194,9 +372,9 @@ public class GameView extends View {
         float x = e.getX(idx), y = e.getY(idx);
 
         switch (state) {
-            case MENU: startGame(); break;
+            case MENU: if (lbBtn.contains(x, y)) showBoard(); else startGame(); break;
             case PAUSED: state = PLAYING; lastNanos = 0; break;
-            case OVER: if (overTimer > 0.9f) startGame(); break;
+            case OVER: if (lbBtn.contains(x, y)) showBoard(); else if (overTimer > 0.9f) startGame(); break;
             case PLAYING:
                 if (pauseBtn.contains(x, y)) { state = PAUSED; break; }
                 tap(x, y);
@@ -503,9 +681,27 @@ public class GameView extends View {
         tp.setTextSize(22 * d);
         tp.setColor(Color.argb((int) (255 * pulse), 255, 255, 255));
         c.drawText("TAP TO START", w / 2f, h * 0.80f, tp);
+        drawLbButton(c, w, h * 0.80f + 52 * d);
         tp.setTextSize(12 * d);
         tp.setColor(Color.argb(140, 255, 255, 255));
         c.drawText("by Buggy Games YT", w / 2f, h - 28 * d, tp);
+    }
+
+    private void drawLbButton(Canvas c, int w, float cy) {
+        float bw = 150 * d, bh = 40 * d;
+        lbBtn.set(w / 2f - bw / 2, cy - bh / 2, w / 2f + bw / 2, cy + bh / 2);
+        p.setStyle(Paint.Style.FILL);
+        p.setColor(Color.argb(60, 255, 255, 255));
+        c.drawRoundRect(lbBtn, 12 * d, 12 * d, p);
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(2 * d);
+        p.setColor(Color.HSVToColor(new float[]{(globalTime * 120) % 360, 0.8f, 1}));
+        c.drawRoundRect(lbBtn, 12 * d, 12 * d, p);
+        p.setStyle(Paint.Style.FILL);
+        tp.setTextAlign(Paint.Align.CENTER);
+        tp.setTextSize(16 * d);
+        tp.setColor(Color.WHITE);
+        c.drawText("🏆 TOP 10", w / 2f, cy + 6 * d, tp);
     }
 
     private void drawPaused(Canvas c, int w, int h) {
@@ -542,6 +738,7 @@ public class GameView extends View {
             tp.setColor(Color.argb((int) (255 * pulse), 255, 255, 255));
             c.drawText("TAP TO PLAY AGAIN", w / 2f, h * 0.75f, tp);
         }
+        drawLbButton(c, w, h * 0.75f + 56 * d);
     }
 
     // ---------------- data classes ----------------

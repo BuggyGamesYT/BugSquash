@@ -1,7 +1,7 @@
 set -e
-export JAVA_HOME=/tmp/jdk PATH=/tmp/jdk/bin:$PATH QEMU_LD_PREFIX=/
+export JAVA_HOME=/tmp/jdk PATH=/tmp/jdk/bin:$PATH QEMU_LD_PREFIX=/usr/x86_64-linux-gnu
 BT=/tmp/bt/android-37.0; AJ=/tmp/plat/android-37.0/android.jar
-export LD_LIBRARY_PATH=$BT/lib64
+export LD_LIBRARY_PATH=$BT/lib64:/usr/x86_64-linux-gnu/lib
 rm -rf build && mkdir -p build/obj build/dex build/gen
 qemu-x86_64 $BT/aapt2 compile --dir res -o build/res.zip
 qemu-x86_64 $BT/aapt2 link -o build/unsigned.apk -I $AJ --manifest AndroidManifest.xml --java build/gen build/res.zip

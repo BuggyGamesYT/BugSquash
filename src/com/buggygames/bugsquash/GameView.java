@@ -62,8 +62,7 @@ public class GameView extends View {
     private final RectF lbBtn = new RectF();
 
     // ---- online leaderboard (shared with the web version) ----
-    private static final String LB_URL = "https://keyvalue.immanuel.co/api/KeyVal/";
-    private static final String LB_APP = "7qj6nvan", LB_KEY = "bugsquash";
+    private static final String LB_DB = "https://bugsquash-leaderboard-default-rtdb.firebaseio.com/bugsquash/scores.json";
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile ArrayList<String[]> board = new ArrayList<>();
     private String myName, lastMine;
@@ -239,22 +238,24 @@ public class GameView extends View {
     }
 
     // ---------------- leaderboard ----------------
-    private String http(String url, boolean post) throws Exception {
-        try { return httpDirect(url, post); }
+    private String http(String url, String body) throws Exception {
+        try { return httpDirect(url, body); }
         catch (Exception e) {
             String err1 = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
             if (web == null) { lastErr = err1; throw e; }
-            try { return httpWeb(url, post); }
+            try { return httpWeb(url, body); }
             catch (Exception e2) { lastErr = err1 + " / web: " + e2.getMessage(); throw e2; }
         }
     }
 
-    private String httpWeb(final String url, final boolean post) throws Exception {
+    private String httpWeb(final String url, final String body) throws Exception {
         final int id;
         synchronized (this) { id = ++webSeq; }
         CountDownLatch l = new CountDownLatch(1);
         webWait.put(id, l);
-        final String js = "fetch(" + jsq(url) + ",{method:'" + (post ? "POST" : "GET") + "',cache:'no-store'})"
+        final String opts = body == null ? "{method:'GET',cache:'no-store'}"
+            : "{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:" + jsq(body) + "}";
+        final String js = "fetch(" + jsq(url) + "," + opts + ")"
             + ".then(r=>r.ok?r.text():Promise.reject('HTTP '+r.status))"
             + ".then(t=>BS.done(" + id + ",true,t)).catch(e=>BS.done(" + id + ",false,String(e)))";
         ui.post(() -> { try { web.evaluateJavascript(js, null); } catch (Throwable t) { webRes.put(id, new String[]{"0", String.valueOf(t)}); l.countDown(); } });
@@ -268,11 +269,17 @@ public class GameView extends View {
 
     private static String jsq(String s) { return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"; }
 
-    private static String httpDirect(String url, boolean post) throws Exception {
+    private static String httpDirect(String url, String body) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(8000); c.setReadTimeout(8000);
         c.setUseCaches(false);
-        if (post) { c.setRequestMethod("POST"); c.setDoOutput(true); c.setFixedLengthStreamingMode(0); c.getOutputStream().close(); }
+        if (body != null) {
+            byte[] bb = body.getBytes("UTF-8");
+            c.setRequestMethod("POST"); c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json");
+            c.setFixedLengthStreamingMode(bb.length);
+            java.io.OutputStream os = c.getOutputStream(); os.write(bb); os.close();
+        }
         int code = c.getResponseCode();
         if (code != 200) { c.disconnect(); throw new Exception("HTTP " + code); }
         InputStream in = c.getInputStream();
@@ -285,45 +292,46 @@ public class GameView extends View {
 
     private static ArrayList<String[]> parse(String t) {
         ArrayList<String[]> out = new ArrayList<>();
-        t = t.trim();
-        if (t.startsWith("\"")) t = t.substring(1);
-        if (t.endsWith("\"")) t = t.substring(0, t.length() - 1);
-        for (String e : t.split("_")) {
-            String[] kv = e.split("-");
-            if (kv.length == 2 && kv[0].matches("[A-Z0-9]{3}") && kv[1].matches("[0-9]{1,7}") && Integer.parseInt(kv[1]) > 0) out.add(kv);
-        }
+        if (t == null || t.trim().isEmpty() || t.trim().equals("null")) return out;
+        java.util.HashMap<String, Integer> best = new java.util.HashMap<>();
+        try {
+            org.json.JSONObject o = new org.json.JSONObject(t);
+            java.util.Iterator<String> it = o.keys();
+            while (it.hasNext()) {
+                org.json.JSONObject e = o.optJSONObject(it.next());
+                if (e == null) continue;
+                String nm = e.optString("n", ""); int sc = e.optInt("s", 0);
+                if (!nm.matches("[A-Z0-9]{3}") || sc <= 0 || sc > 100000) continue;
+                Integer b = best.get(nm);
+                if (b == null || sc > b) best.put(nm, sc);
+            }
+        } catch (Exception ignored) {}
+        for (java.util.Map.Entry<String, Integer> e : best.entrySet()) out.add(new String[]{e.getKey(), String.valueOf(e.getValue())});
+        out.sort((x, y) -> Integer.parseInt(y[1]) - Integer.parseInt(x[1]));
+        while (out.size() > 10) out.remove(out.size() - 1);
         return out;
     }
 
     private boolean lbGet() {
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 3; i++) {
             try {
-                String raw = http(LB_URL + "GetValue/" + LB_APP + "/" + LB_KEY, false);
+                String raw = http(LB_DB + "?orderBy=%22s%22&limitToLast=200", null);
                 board = parse(raw); lastErr = "";
                 prefs.edit().putString("board", raw).apply();
                 return true;
             }
             catch (Exception ignored) {}
-            try { Thread.sleep(700 + i * 500); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(600 + i * 500); } catch (InterruptedException ignored) {}
         }
         return false;
     }
 
     private boolean lbSubmit(String name, int sc) {
-        for (int i = 0; i < 5; i++) {
-            if (lbGet()) {
-                ArrayList<String[]> b = new ArrayList<>();
-                int old = 0;
-                for (String[] e : board) { if (e[0].equals(name)) old = Integer.parseInt(e[1]); else b.add(e); }
-                b.add(new String[]{name, String.valueOf(Math.max(sc, old))});
-                b.sort((x, y) -> Integer.parseInt(y[1]) - Integer.parseInt(x[1]));
-                while (b.size() > 10) b.remove(b.size() - 1);
-                StringBuilder sb = new StringBuilder();
-                for (String[] e : b) { if (sb.length() > 0) sb.append('_'); sb.append(e[0]).append('-').append(e[1]); }
-                try { http(LB_URL + "UpdateValue/" + LB_APP + "/" + LB_KEY + "/" + sb, true); board = b; return true; }
-                catch (Exception ignored) {}
-            }
-            try { Thread.sleep(800 + i * 600); } catch (InterruptedException ignored) {}
+        String body = "{\"n\":\"" + name + "\",\"s\":" + sc + ",\"t\":" + System.currentTimeMillis() + "}";
+        for (int i = 0; i < 4; i++) {
+            try { http(LB_DB, body); lbGet(); return true; }
+            catch (Exception ignored) {}
+            try { Thread.sleep(700 + i * 600); } catch (InterruptedException ignored) {}
         }
         return false;
     }
